@@ -29,6 +29,7 @@ import fs from 'node:fs'
 import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { externalUrl, openExternal } from './src/open-external.js'
+import { findBunExecutable } from './src/bun-fetch.js'
 import { ROUTE_LABELS, ROUTE_MAIN, ROUTE_REGION } from './src/adapter.js'
 import { DATA_DIR_NAME, resolveDshHome, publicModelVisibility, validateModelVisibility, isModelHidden } from './src/store.js'
 import { isEacEntry, isKiloEntry } from './src/catalog.js'
@@ -36,7 +37,7 @@ import { STATE } from './src/probe.js'
 import { generateKey, rankLanAddresses, startForwardServer, startLanRelay } from './src/forward.js'
 import { chanGatewayCredential, chanGatewayEnabled, chanGatewayPort, startChanRelay } from './src/chan-relay.js'
 import { CODE, UpstreamError } from './src/http.js'
-import { egressActive, egressFetch, outletLabel, readOutletSelection, startEgressRelay } from './src/egress.js'
+import { egressActive, egressFetch, outletLabel, readOutletSelection, startEgressRelay, setFreeLaneProxy, freeLaneProxyActive, laneProxyEcho } from './src/egress.js'
 import { directFetch } from './src/eac.js'
 import { clearEacUser, readEacUser, writeEacUser } from './src/eac-user.js'
 import { createEacLoginPoller } from './src/eac-login.js'
@@ -60,7 +61,9 @@ import { createModelRuntime, createRuntimeStores } from './src/core.js'
 import { createSubscriptions } from './src/subscriptions.js'
 import { createSubscriptionRuntime } from './src/subscription-completion.js'
 import { isSubscriptionEntry } from './src/subscription-adapter.js'
-import { createMagpieEngine } from './src/magpie-engine.js'
+import { createMagpieEngine, findAgentCli } from './src/magpie-engine.js'
+import { createExtensionRuntime } from './src/extensions.js'
+import { builtinDescriptors } from './src/plugins.js'
 import { createMagpieModels, combineSubscriptionRuntimes } from './src/magpie-models.js'
 import { DISCLAIMER, DISCLAIMER_VERSION, disclaimerAcknowledged } from './src/disclaimer.js'
 
@@ -144,6 +147,15 @@ export function apply(ctx, config) {
   const dataDir = path.resolve(home, DATA_DIR_NAME)
   fs.mkdirSync(dataDir, { recursive: true })
   const packageVersion = version
+
+  // Environment readiness: the official free lane's POST inference needs a
+  // local Bun, and a user who never learns that reads only a failed turn.
+  // Probe once at boot — the summary's `bun` bit and this log line are the two
+  // surfaces the answer lives on.
+  const bunAvailable = findBunExecutable() !== undefined
+  if (!bunAvailable) {
+    logger.warn?.('our-free-model: 未检测到本机 Bun —— OpenCode 免费车道无法推理。请安装 Bun（https://bun.sh 或 npm i -g bun）后重启，或把可执行文件路径写入 OUR_FREE_MODEL_BUN。(Bun not found: the OpenCode free lane cannot run inference)')
+  }
 
   // A hot reload re-enters apply with fresh stores; the generation counter lives
   // on globalThis so the new instance knows it replaced a predecessor, and does
@@ -414,9 +426,13 @@ export function apply(ctx, config) {
   }
 
   const magpieEngine = createMagpieEngine({ dataDir, logger })
+  // The extension runtime is created a few lines below; the lazy reference
+  // gives the magpie lane the enhancement-hook seam without reordering boot.
+  let extensionHookRuntime = null
   const magpieModels = createMagpieModels({
     engine: magpieEngine, stats, logger,
     onChanged: () => modelRuntime.syncAggregateCatalog(),
+    extensionRuntime: () => extensionHookRuntime,
   })
   let subscriptions
   let subscriptionRuntime
@@ -429,17 +445,35 @@ export function apply(ctx, config) {
     logger.warn?.('our-free-model: private subscription storage is unavailable')
   }
   subscriptionRuntime = combineSubscriptionRuntimes(magpieModels, subscriptionRuntime)
+  // The OFM extension platform: the marketplace's client side. Created before
+  // the model runtime so the extension lane exists for the first merge; the
+  // async mount (worker starts, registry warm-up) lands through the callback.
+  const extensions = createExtensionRuntime({
+    dataDir,
+    logger,
+    hostVersion: packageVersion,
+    onCatalogChanged: () => {
+      if (disposed) return
+      try { modelRuntime.syncExtensionCatalog() } catch { /* the runtime may not exist yet during boot */ }
+    },
+  })
+  // Built-ins register through the same kernel as installed plugins. The DSH
+  // client renders channel/enhancement contributions; page contributions are
+  // a desktop-console surface.
+  for (const descriptor of builtinDescriptors()) extensions.registerBuiltin(descriptor)
+  extensionHookRuntime = extensions
   const modelRuntime = createModelRuntime({
     ...stores,
     logger,
     subscriptionRuntime,
+    extensionRuntime: extensions,
     attributionUserAgent: 'deepseek-harness',
     resolveImage: imageResolver(ctx, logger),
     sealedCredential: sealedCredentialOf,
     onSealedUnavailable: () => logger.warn?.('our-free-model: the sealed lane is not available in this composition (no recognized host profile); its models stay hidden'),
     onTopology: () => emitTopology(),
   })
-  const { state, adapter, refreshCatalog, refreshAvailability, watchEgress, fetchListing, publicModelRows, syncAggregateCatalog } = modelRuntime
+  const { state, adapter, refreshCatalog, refreshAvailability, watchEgress, fetchListing, publicModelRows, syncAggregateCatalog, clearLaneBreaker } = modelRuntime
   const runForwarded = modelRuntime.complete
 
   // ── registration ────────────────────────────────────────────────────────────
@@ -857,6 +891,23 @@ export function apply(ctx, config) {
     outletSyncInFlight = run
     try { await run } finally { if (outletSyncInFlight === run) outletSyncInFlight = null }
   }
+  /**
+   * Apply the settings file's lane proxy to the egress layer.
+   *
+   * Boot-time sync; the settings route re-applies on every `freeLane` patch
+   * through `sanitizeSettings` (which is where a bad address fails the write).
+   * A stored value that no longer parses is dropped with one log line — the
+   * lane falls back to the global outlet rather than failing every turn.
+   */
+  function syncFreeLaneProxy() {
+    try {
+      setFreeLaneProxy(String(settings.get().freeLane?.proxyUrl ?? ''))
+    } catch (error) {
+      logger.warn?.(`our-free-model: the OpenCode lane proxy address is invalid (${error?.message ?? error}); the lane keeps its current exit`)
+      setFreeLaneProxy('')
+    }
+  }
+  syncFreeLaneProxy()
   async function syncEgressOnce() {
     const desired = settings.get().egress ?? {}
     const wanted = desired.enabled === true
@@ -1086,7 +1137,9 @@ export function apply(ctx, config) {
   }
   const api = createApiRoutes({
     settings, stats, availability, catalog: () => modelRuntime.catalog, state,
-    refreshCatalog, refreshAvailability, syncForward, syncRelay, syncEgress,
+    refreshCatalog, refreshAvailability, syncForward, syncRelay, syncEgress, clearLaneBreaker,
+    extensions,
+    bunAvailable,
     onVisibilityChanged: emitTopology,
     pool: fetchPoolSnapshot,
     eacAuth,
@@ -1440,6 +1493,7 @@ export function apply(ctx, config) {
 
   // ── boot + background loop ──────────────────────────────────────────────────
   ctx.effect(() => () => {
+    extensions.dispose()
     magpieModels.close()
     const closing = magpieEngine.close()
     modelRuntime.dispose()
@@ -1452,8 +1506,39 @@ export function apply(ctx, config) {
       void magpieEngine.start().then(() => magpieModels.refresh()).catch(() => {
         logger.warn?.('our-free-model: model workspace could not resume')
       })
+      // The engine connects Claude through the locally installed Claude Code
+      // CLI; its own downloader cannot reach the release host from every
+      // network, so a pre-installed CLI is the practical requirement. Warn at
+      // boot — the user's first failed connect is too late to learn it.
+      if (findAgentCli('claude') === undefined) {
+        logger.warn?.('our-free-model: 未检测到 Claude Code CLI —— 在模型工作台连接 Claude 前请先安装（npm i -g @anthropic-ai/claude-code）。(Claude Code CLI not found; install it before connecting Claude in the model workspace)')
+      }
     }
   }, 'our-free-model: model workspace')
+
+  ctx.effect(() => {
+    // The extension mount: start every installed, enabled extension (its
+    // catalog lands through onCatalogChanged → syncExtensionCatalog), then
+    // warm the marketplace cache in the background — a cold registry only
+    // means an empty Discover tab, never a blocked lane.
+    void extensions.init().catch(error => {
+      logger.warn?.(`our-free-model: extension mount failed (${error?.message ?? error})`)
+    })
+    void extensions.refreshRegistry().catch(() => {})
+    // The marketplace index refreshes on its own cadence too: an update that
+    // lands upstream should reach the Installed tab without the user opening
+    // the market first. The TTL cache keeps ticks cheap; failures are silent —
+    // the next tick retries and the last good view keeps serving.
+    const registryTimer = setInterval(() => {
+      void extensions.refreshRegistry().catch(() => {})
+      // The automatic updater rides the same tick: it only installs what the
+      // soak has already cleared, so no extra network touch beyond the
+      // refresh's own fetches, and a failure is next tick's retry.
+      if (settings.get().autoUpdateExtensions === true) void extensions.autoUpdate().catch(() => {})
+    }, 6 * 60 * 60 * 1000)
+    registryTimer.unref?.()
+    return () => clearInterval(registryTimer)
+  }, 'our-free-model: extensions')
 
   ctx.effect(() => () => {
     void forward?.close().catch(() => {})
@@ -1566,7 +1651,9 @@ export function apply(ctx, config) {
   every(() => {
     void (async () => {
       await watchEgress()
-      await refreshCatalog({ probe: false })
+      // throttleListing: the periodic round may keep the cached roster when it
+      // just refreshed — the upstream listing is read at most once per window.
+      await refreshCatalog({ probe: false, throttleListing: true })
     })().catch(error => logger.warn?.(`our-free-model: periodic refresh failed (${error?.message ?? error})`))
   }, () => positiveOr(settings.get().probeIntervalMinutes, 15, 1) * 60_000)
   // A failing egress watch means the network is down, which is worth one line —
@@ -1662,6 +1749,16 @@ function sanitizeSettings(patch, current) {
     // Zero is a real answer here: it means "stop checking for updates".
     const hours = Number(next.updateCheckHours)
     next.updateCheckHours = Number.isFinite(hours) && hours >= 0 ? Math.trunc(hours) : (Number(current.updateCheckHours) || 6)
+  }
+  if (next.freeLane !== undefined) {
+    // The lane proxy is a URL the egress layer validates on save: a typo must
+    // fail the write, not the first turn. Everything else about the object is
+    // carried verbatim.
+    const incoming = next.freeLane
+    const merged = { ...(current.freeLane ?? {}), ...(incoming && typeof incoming === 'object' ? incoming : {}) }
+    const proxyUrl = String(merged.proxyUrl ?? '').trim()
+    setFreeLaneProxy(proxyUrl)
+    next.freeLane = { ...merged, proxyUrl }
   }
   return next
 }
@@ -1987,7 +2084,7 @@ export function createApiRoutes(deps) {
         const patch = await readJson(req)
         const visibility = validateModelVisibility(patch)
         const current = deps.settings.get()
-        const next = sanitizeSettings({ ...current, ...pick(patch, ['enabled', 'exposeRegionModels', 'probeIntervalMinutes', 'defaultMaxTokens', 'announcementAck', 'feedUrl', 'feedPollMinutes', 'notifyOs', 'updateCheckHours', 'autoReloadWatch']), ...visibility }, current)
+        const next = sanitizeSettings({ ...current, ...pick(patch, ['enabled', 'exposeRegionModels', 'probeIntervalMinutes', 'defaultMaxTokens', 'announcementAck', 'feedUrl', 'feedPollMinutes', 'notifyOs', 'updateCheckHours', 'autoReloadWatch', 'freeLane', 'developerPlugins', 'autoUpdateExtensions']), ...visibility }, current)
         if (next.autoReloadWatch === true && deps.update.status().hotReloadAvailable === false) next.autoReloadWatch = false
         if (patch.forward !== undefined) {
           const forward = { ...(current.forward ?? {}), ...pick(patch.forward, ['enabled', 'host', 'port']) }
@@ -2053,8 +2150,134 @@ export function createApiRoutes(deps) {
         return send(200, { ok: true, ...buildSummary(deps) })
       }
       if (method === 'POST' && routePath === '/reprobe') {
-        await deps.refreshAvailability(true)
-        return send(200, { ok: true, ...buildSummary(deps) })
+        // One probe, one model: the caller's pick, or the roster head. The
+        // quota breaker refuses while a window is open (the response names it).
+        const body = await readJson(req).catch(() => ({}))
+        const outcome = await deps.refreshAvailability(true, { model: typeof body?.model === 'string' ? body.model : undefined })
+        return send(200, { ok: true, probe: outcome, ...buildSummary(deps) })
+      }
+      if (method === 'POST' && routePath === '/lane/clear') {
+        // 换出口后重试一次：出口已变（或用户自备了新出口代理），把额度断路器
+        // 清掉，让下一次手动检测/真实回合重新出发。一次调用只清一次。
+        const cleared = deps.clearLaneBreaker()
+        return send(200, { ok: true, cleared, ...buildSummary(deps) })
+      }
+      if (method === 'POST' && routePath === '/lane/echo') {
+        // 测试出口：打第三方回显服务，不打免费网关 —— 一次测试不花配额。
+        try {
+          const echo = await laneProxyEcho({ signal: req.signal ?? undefined })
+          return send(200, { ok: true, ...echo })
+        } catch (error) {
+          return send(502, { ok: false, error: String(error?.message ?? error).slice(0, 200) })
+        }
+      }
+
+      // ── the extension marketplace ───────────────────────────────────────────
+      if (routePath === '/extensions' || routePath.startsWith('/extensions/')) {
+        if (deps.extensions === undefined) return send(503, { error: 'the extension platform is unavailable' })
+        const extensions = deps.extensions
+        if (method === 'GET' && routePath === '/extensions/cover') {
+          // The marketplace card's banner. An <img> cannot attach headers, so
+          // the image rides the same admission fence as every fetch from the
+          // settings page — same origin, same cookies, same gate. Failure is
+          // a 404 the card renders without; a missing banner never breaks it.
+          const image = await extensions.coverImage(url.searchParams.get('id') ?? '')
+          if (image === null) return send(404, { error: 'no cover for this extension' })
+          res.writeHead(200, {
+            'content-type': image.contentType,
+            'content-length': image.bytes.length,
+            // Cosmetics only: a stale banner for a few minutes is invisible.
+            'cache-control': 'private, max-age=600',
+            'x-content-type-options': 'nosniff',
+          })
+          res.end(image.bytes)
+          return
+        }
+        if (method === 'GET' && routePath === '/extensions') {
+          // A first paint waits briefly for the boot warm-up and hears why a
+          // read failed; `registryError` used to be structurally empty because
+          // `registryView()` never throws.
+          const status = await extensions.registryStatusSoon()
+          // `updates` feeds the soak countdown on the Installed tab; `audit`
+          // gives the page its own 最近操作 trail; the settings bit lets the
+          // toolbar's auto-update switch render the value it will write.
+          return send(200, {
+            installed: extensions.listInstalled().filter(record => record.builtin !== true),
+            registry: status.registry,
+            registryError: status.error,
+            updates: extensions.updatesAvailable(),
+            registryMeta: extensions.registryMeta(),
+            audit: extensions.auditTail(30),
+            autoUpdate: deps.settings.get().autoUpdateExtensions === true,
+          })
+        }
+        if (method === 'POST' && routePath === '/extensions/registry/refresh') {
+          try {
+            await extensions.refreshRegistry({ force: true })
+            return send(200, { ok: true, installed: extensions.listInstalled().filter(record => record.builtin !== true), registry: extensions.registryView() })
+          } catch (error) {
+            return send(502, { error: String(error?.message ?? error), installed: extensions.listInstalled().filter(record => record.builtin !== true) })
+          }
+        }
+        if (method === 'POST' && routePath === '/extensions/install') {
+          const body = await readJson(req)
+          try {
+            const record = await extensions.install(String(body?.id ?? ''), { version: typeof body?.version === 'string' ? body.version : undefined })
+            return send(200, { ok: true, record, installed: extensions.listInstalled().filter(record => record.builtin !== true) })
+          } catch (error) {
+            return send(400, { error: String(error?.message ?? error) })
+          }
+        }
+        if (method === 'POST' && routePath === '/extensions/uninstall') {
+          const body = await readJson(req)
+          try {
+            await extensions.uninstall(String(body?.id ?? ''))
+            return send(200, { ok: true, installed: extensions.listInstalled().filter(record => record.builtin !== true) })
+          } catch (error) {
+            return send(400, { error: String(error?.message ?? error) })
+          }
+        }
+        if (method === 'POST' && routePath === '/extensions/toggle') {
+          const body = await readJson(req)
+          try {
+            const record = await extensions.setEnabled(String(body?.id ?? ''), body?.enabled === true)
+            return send(200, { ok: true, record, installed: extensions.listInstalled().filter(record => record.builtin !== true) })
+          } catch (error) {
+            return send(400, { error: String(error?.message ?? error) })
+          }
+        }
+        if (method === 'POST' && routePath === '/extensions/config') {
+          const body = await readJson(req)
+          try {
+            const record = await extensions.saveConfig(String(body?.id ?? ''), body?.values ?? {})
+            // `installed` travels with every mutation: the page renders its cards
+            // from it, so a config write has to hand the new values back or the
+            // control snaps to the state it was rendered with.
+            return send(200, { ok: true, record, installed: extensions.listInstalled().filter(record => record.builtin !== true) })
+          } catch (error) {
+            return send(400, { error: String(error?.message ?? error) })
+          }
+        }
+        if (method === 'POST' && routePath === '/extensions/secret') {
+          const body = await readJson(req)
+          try {
+            const record = await extensions.saveSecret(String(body?.id ?? ''), String(body?.key ?? ''), body?.value)
+            return send(200, { ok: true, record, installed: extensions.listInstalled().filter(record => record.builtin !== true) })
+          } catch (error) {
+            return send(400, { error: String(error?.message ?? error) })
+          }
+        }
+        if (method === 'POST' && routePath === '/extensions/self-test') {
+          // The manifest's optional selfTest(ctx) on demand; the verdict rides
+          // back as data (a failed hook is a result, not an HTTP error), so the
+          // card renders ✗ + reason instead of the page falling into the toast.
+          const body = await readJson(req)
+          try {
+            return send(200, await extensions.runSelfTest(String(body?.id ?? '')))
+          } catch (error) {
+            return send(400, { error: String(error?.message ?? error) })
+          }
+        }
       }
       if (method === 'GET' && routePath === '/forward/key') {
         return send(200, { key: deps.settings.get().forwardKey ?? '' })
@@ -2469,6 +2692,19 @@ function buildSummary(deps) {
     settings: publicSettings(deps.settings.get(), forwardInfo, deps.egressInfo()),
     egress: forwardInfo.egress ?? snapshot.egress ?? null,
     outlet: deps.egressInfo(),
+    // The free lane's quota breaker and its exit: what the page's lane card
+    // renders as the countdown / lock banner, and the proxy seam issue #708's
+    // bypass reduces to. `lane` is null until a real verdict exists.
+    lane: snapshot.lane ?? null,
+    freeLane: {
+      proxyActive: freeLaneProxyActive(),
+      proxyConfigured: String(deps.settings.get().freeLane?.proxyUrl ?? '').trim() !== '',
+      transport: process.env.OUR_FREE_MODEL_FREE_TRANSPORT ?? 'auto',
+    },
+    // Environment readiness for the free lane: the official POST inference
+    // needs a local Bun, and a user who never learns that reads only a failed
+    // turn. Probed once at boot (see the readiness effect below).
+    bun: deps.bunAvailable !== false,
     probedAt: snapshot.at ?? 0,
     announcementVersion: ANNOUNCEMENT_VERSION,
     disclaimerVersion: DISCLAIMER_VERSION,
@@ -2486,6 +2722,7 @@ function buildSummary(deps) {
     // Whether the absorbed free-channel pack is live on this host, and its
     // failure reason when it is not (see the mount in `apply`).
     channels: deps.channels?.() ?? { state: 'unknown', error: '' },
+    extensions: deps.extensions !== undefined ? { installed: deps.extensions.listInstalled().filter(record => record.builtin !== true) } : null,
     update: { available: update.available, latest: update.latest, current: update.current, checkedAt: update.checkedAt, applying: update.applying, managed: update.managed === true },
   }
 }

@@ -47,6 +47,12 @@ const sourceFiles = [
   // (src/o2a/SYNC.md), shipped as the release bundle built by
   // build-legacy-payload.mjs — the official assets are inlined into it.
   'src/o2a.js',
+  // The extension platform the standalone service mounts like the plugin does
+  'src/extensions.js',
+  // The plugin kernel: manifest, scans, built-ins, page bridge, bundled shelf
+  'src/plugins.js',
+  // The semver helpers extensions.js imports (updater.js is not shipped here)
+  'src/semver.js',
   'src/providers/index.js',
   'src/providers/registry.json',
   'src/route/classify.js',
