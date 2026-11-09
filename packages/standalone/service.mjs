@@ -15,6 +15,9 @@ import { createMagpieEngine, findAgentCli } from '../../src/magpie-engine.js'
 import { createExtensionRuntime } from '../../src/extensions.js'
 import { builtinDescriptors } from '../../src/plugins.js'
 import { combineSubscriptionRuntimes, createMagpieModels } from '../../src/magpie-models.js'
+import { COMBO_CHANNEL, comboChain, normalizeCombos } from '../../src/combos.js'
+import { baseModelId } from '../../src/upstream.js'
+import { recordTurn } from '../../src/store.js'
 
 const PRODUCT = 'our-free-model-standalone'
 const VERSION = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version
@@ -287,6 +290,74 @@ export async function startStandalone({
     })
     channels = await createChannelRuntime({ dataDir, logger, stats: stores.stats })
     const core = runtime
+    // Account-channel models are appended to the runtime catalog *after* the core
+    // rebuilds it, so the core's own combo builder never sees them: a chain with
+    // channel members silently loses them and reports "exhausted every candidate"
+    // while every member works when dialed directly. Resolve and walk such chains
+    // here instead, where both completers are in reach — the same commit rule as
+    // the core's runCombo (buffer until the first answer-bearing delta), with each
+    // candidate routed to the completer that owns it.
+    const comboForRequest = model => {
+      const id = baseModelId(String(model ?? ''))
+      if (!id.startsWith('combo:')) return null
+      return normalizeCombos(settings.get().combos).find(row => row.id === id && row.enabled !== false) ?? null
+    }
+    const commitsAnswerChunk = chunk => {
+      if (chunk === null || typeof chunk !== 'object') return false
+      if (chunk.type === 'text-delta') return typeof chunk.text === 'string' && chunk.text.trim() !== ''
+      if (chunk.type === 'tool-call-delta') return true
+      if (chunk.type !== 'block-end') return false
+      if (chunk.block?.type === 'reasoning') return false
+      if (chunk.block?.type === 'text') return typeof chunk.block.text === 'string' && chunk.block.text.trim() !== ''
+      return true
+    }
+    const completeCombo = async (request, onChunk, combo) => {
+      const started = Date.now()
+      const catalog = [...core.catalog, ...channels.publicModelRows().map(row => ({ ...row, contextWindow: row.context_window, maxOutput: row.max_tokens }))]
+      const entry = { id: combo.id, name: combo.name, channel: COMBO_CHANNEL, combo: combo.models, strategy: combo.strategy, stickyLimit: combo.stickyLimit }
+      const candidates = comboChain(entry, catalog, core.state().routing ?? {})
+      if (candidates.length === 0) {
+        recordTurn(stores.stats, { model: combo.id, at: started, ok: false, recovered: false, attempts: 0, origin: 'harness' })
+        return { text: '', toolCalls: [], usage: undefined, truncated: false, error: { message: `the chain "${combo.name}" has no model available on this egress` } }
+      }
+      const tried = []
+      let attempts = 0
+      for (const candidate of candidates) {
+        attempts += 1
+        let committed = false
+        const held = []
+        const capture = chunk => {
+          if (committed) { onChunk?.(chunk); return }
+          held.push(chunk)
+          if (commitsAnswerChunk(chunk)) {
+            committed = true
+            for (const early of held) onChunk?.(early)
+            held.length = 0
+          }
+        }
+        const run = channels.handles(candidate.id) ? channels.complete : core.complete
+        let result
+        try {
+          result = await run({ ...request, model: candidate.id }, capture)
+        } catch (error) {
+          if (request.signal?.aborted === true) throw error
+          result = { text: '', toolCalls: [], usage: undefined, truncated: false, error: { message: String(error?.message ?? error) } }
+        }
+        if (committed) {
+          recordTurn(stores.stats, { model: combo.id, at: started, ok: result?.error === undefined, recovered: attempts > 1, attempts, origin: 'harness' })
+          return result
+        }
+        const reason = result?.error?.message ?? 'no answer'
+        tried.push(`${candidate.id} (${reason})`)
+        logger.warn?.(`our-free-model: chain "${combo.name}" advanced past ${candidate.id} — ${reason}`)
+        if (request.signal?.aborted === true) {
+          recordTurn(stores.stats, { model: combo.id, at: started, ok: false, recovered: false, attempts, origin: 'harness' })
+          return result
+        }
+      }
+      recordTurn(stores.stats, { model: combo.id, at: started, ok: false, recovered: false, attempts, origin: 'harness' })
+      return { text: '', toolCalls: [], usage: undefined, truncated: false, error: { message: `the chain "${combo.name}" exhausted every candidate: ${tried.join('; ')}` } }
+    }
     runtime = {
       ...core,
       get egress() { return core.egress },
@@ -294,7 +365,11 @@ export async function startStandalone({
       get catalog() { return [...core.catalog, ...channels.publicModelRows().map(row => ({ ...row, contextWindow: row.context_window, maxOutput: row.max_tokens }))] },
       state: () => ({ ...core.state(), catalog: [...core.catalog, ...channels.publicModelRows()] }),
       publicModelRows: () => [...core.publicModelRows(), ...channels.publicModelRows()],
-      complete: (request, onChunk) => channels.handles(request.model) ? channels.complete(request, onChunk) : core.complete(request, onChunk),
+      complete: (request, onChunk) => {
+        const combo = comboForRequest(request.model)
+        if (combo !== null) return completeCombo(request, onChunk, combo)
+        return channels.handles(request.model) ? channels.complete(request, onChunk) : core.complete(request, onChunk)
+      },
       async refreshCatalog(options) {
         if (stopped) return
         const [result, channelResult] = await Promise.all([core.refreshCatalog(options), channels.refresh(options).catch(error => { if (!stopped) throw error })])
