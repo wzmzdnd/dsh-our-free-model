@@ -58738,7 +58738,10 @@ function registerChannelPackEndpoints(ctx, pool, lobsterai, qoder, qoderCn, trae
           const values = await collectCreditBalances(accounts, GEMINI, {
             resolve: (ref) => ctx.credentials.resolve(ref),
             fetchBalanceDetailed: async (credential) => {
-              const { balance, error, tier } = await fetchGeminiCreditBalance(credential, GEMINI, { force: req.force === true });
+              const { balance, error, tier } = await fetchGeminiCreditBalance(credential, GEMINI, {
+                force: req.force === true,
+                ...config.fetcher === void 0 ? {} : { fetcher: config.fetcher }
+              });
               const extra = tier === void 0 ? void 0 : { accountTier: { label: tier.label, title: `${tier.name}\uFF08${tier.id}\uFF09` } };
               return {
                 balance,
@@ -60557,11 +60560,8 @@ async function toMessages(input, provider, model, bridge, limits) {
     }
     if (type === "function_call_output") {
       const callId = nonEmptyString2(raw.call_id);
-      if (callId === void 0) throw new OpenAiGatewayError("function_call_output requires call_id");
-      messages.push(createGatewayToolMessage(
-        callId,
-        await outputParts(raw.output, bridge, limits)
-      ));
+      if (callId === void 0) continue;
+      messages.push(createGatewayToolMessage(callId, await outputParts(raw.output, bridge, limits)));
       continue;
     }
     if (type === "reasoning") {
@@ -60735,7 +60735,7 @@ function restoreToolName(item, nsMap) {
   const entry = nsMap?.get(name2);
   return entry === void 0 ? { name: name2 } : { name: entry.name, namespace: entry.namespace };
 }
-function outputItemJson(item, nsMap) {
+function outputItemJson(item, nsMap, hasTools) {
   if (item.kind === "reasoning") {
     const text = finalText(item);
     return {
@@ -60761,6 +60761,7 @@ function outputItemJson(item, nsMap) {
     type: "message",
     status: "completed",
     role: "assistant",
+    phase: hasTools === true ? "commentary" : "final_answer",
     content: [{ type: "output_text", text: finalText(item), annotations: [], logprobs: [] }]
   };
 }
@@ -60802,8 +60803,9 @@ function statusOf(state) {
   return state.finishReason === "length" ? "incomplete" : "completed";
 }
 function outputOf(items, nsMap) {
-  const output = [...items].sort((a, b) => a.outputIndex - b.outputIndex).filter(hasContent).map((item) => outputItemJson(item, nsMap));
-  if (output.length === 0) output.push(outputItemJson(newItem(-1, 0, "message")));
+  const hasTools = items.some((it) => it.kind === "function_call");
+  const output = [...items].sort((a, b) => a.outputIndex - b.outputIndex).filter(hasContent).map((item) => outputItemJson(item, nsMap, hasTools));
+  if (output.length === 0) output.push(outputItemJson(newItem(-1, 0, "message"), nsMap, false));
   return output;
 }
 async function toUpstreamError(error, suggest) {
@@ -60980,7 +60982,7 @@ data: ${JSON.stringify({ type, sequence_number: sequence++, ...payload })}
         arguments: finalArguments(item)
       }));
     }
-    events.push(emit("response.output_item.done", { output_index: item.outputIndex, item: outputItemJson(item, nsMap) }));
+    if (item.kind !== "message") events.push(emit("response.output_item.done", { output_index: item.outputIndex, item: outputItemJson(item, nsMap) }));
     closed.add(item.index);
     items.push(item);
     return events;
@@ -60990,6 +60992,10 @@ data: ${JSON.stringify({ type, sequence_number: sequence++, ...payload })}
     for (const [index, item] of [...open.entries()].sort(([a], [b]) => a - b)) {
       events.push(...closeItem(item));
       open.delete(index);
+    }
+    const hasTools = items.some((item) => item.kind === "function_call");
+    for (const item of items) {
+      if (item.kind === "message") events.push(emit("response.output_item.done", { output_index: item.outputIndex, item: outputItemJson(item, nsMap, hasTools) }));
     }
     return events;
   };
@@ -65535,7 +65541,9 @@ function apply(ctx, config = {}) {
     });
   });
   registerChannelPackRpc(ctx, pool, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, gemini, modelAdapters, {
-    ...config
+    ...config,
+    // ⚠️ 配额等附属查询必须复用同一出口；省略会让 gemini-credits 回落到裸 fetch。
+    fetcher: network.fetch
   });
   mountOpenAiGateway(ctx, pool);
   installLoopResume(ctx);

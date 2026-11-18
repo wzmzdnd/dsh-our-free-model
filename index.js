@@ -43,8 +43,8 @@ import { clearEacUser, readEacUser, writeEacUser } from './src/eac-user.js'
 import { createEacLoginPoller } from './src/eac-login.js'
 import { unlockSealedLane } from './src/vault.js'
 import { DEFAULT_LEVEL, budgetLadder, hasDeclaredEffortMenu } from './src/effort.js'
-import { modelAvailability } from './src/model-test.js'
-import { AnnouncementFeed } from './src/feed.js'
+import { readPerf, readSeries, siteRootFor, modelAvailability } from './src/model-test.js'
+import { AnnouncementFeed, createFeedback } from './src/feed.js'
 import { createPickStats } from './src/picks.js'
 import { PluginUpdater, installationIsManaged } from './src/updater.js'
 import { selfReload, watchPackage, isReloading, canSafelyHotReload } from './src/reload.js'
@@ -170,6 +170,19 @@ export function apply(ctx, config) {
   if (generation > 1) {
     settings.update({ reloadedAt: Date.now(), reloadCount: generation - 1 })
     settings.flush()
+  } else {
+    // Before issue #761 the only "already seen" marker lived in the browser's
+    // origin-scoped localStorage. A settings file from that build can carry an
+    // old reloadedAt with no acknowledgement beside it; adopting it here keeps
+    // a plain process restart (a new desktop port is a new origin) from
+    // replaying a stale notice. A genuinely new reload writes a new timestamp.
+    const stored = settings.get()
+    const at = Number(stored.reloadedAt ?? 0)
+    const seen = Number(stored.reloadNoticeSeen ?? 0)
+    if (Number.isSafeInteger(at) && at > 0 && seen === 0) {
+      settings.update({ reloadNoticeSeen: at })
+      settings.flush()
+    }
   }
 
   /** `managed` stands down everything that would rewrite the installed bytes. */
@@ -376,6 +389,19 @@ export function apply(ctx, config) {
   const picks = createPickStats({
     cacheFile: path.join(dataDir, 'picks.json'),
     log: message => logger.info?.(message),
+  })
+
+  // The feedback form's server half: device-flow sign-in against the project's
+  // collector, and submission of one problem report or feature wish. It lives
+  // beside the feed because both are "one remote endpoint, fail-soft, validated
+  // on the way in", and because a shipped module of its own would break the
+  // 80-file release-set ceiling that older upgraders enforce.
+  //
+  // `persist` writes through the settings store, so the token survives a restart
+  // on this machine only — it is never sent back to the page.
+  const feedback = createFeedback({
+    settings: () => settings.get(),
+    persist: patch => { settings.update(patch); settings.flush() },
   })
 
   /**
@@ -1087,7 +1113,14 @@ export function apply(ctx, config) {
    * — while the service is missing, which is what makes the fence fall through to
    * its own structural check instead of reading as "admitted".
    */
-  const fenceConnection = connectionAdmissionView(() => optional('connection'))
+  let admittedConnection
+  ctx.inject(['connection', 'connection.authentication'], scoped => {
+    scoped.effect(() => {
+      admittedConnection = typeof scoped.get === 'function' ? scoped.get('connection') : undefined
+      return () => { admittedConnection = undefined }
+    }, 'our-free-model: connection trust')
+  })
+  const fenceConnection = connectionAdmissionView(() => admittedConnection ?? optional('connection'))
   // ── the absorbed free-channel pack ──────────────────────────────────────────
   /**
    * The 白嫖 channels — LobsterAI
@@ -1144,6 +1177,7 @@ export function apply(ctx, config) {
     pool: fetchPoolSnapshot,
     eacAuth,
     picks,
+    feedback,
     magpieEngine,
     magpieModels,
     onEngineStarted: () => {
@@ -1152,6 +1186,10 @@ export function apply(ctx, config) {
     },
     subscriptions,
     onSubscriptionsChanged: syncAggregateCatalog,
+    // The sealed credential names the lane's base (`…/eac/v1`); the perf route
+    // derives the site root from it so the metrics endpoint is found without a
+    // second hard-coded address.
+    sealedCredential: sealedCredentialOf,
     // ── the aggregate lane's settings surface ────────────────────────────────
     // The registry is static data; the configured half is the settings file with
     // every key masked. Writing one provider rebuilds the catalog and re-emits
@@ -1404,6 +1442,7 @@ export function apply(ctx, config) {
       generation,
       reloadedAt: settings.get().reloadedAt ?? 0,
       reloadCount: settings.get().reloadCount ?? 0,
+      reloadNoticeSeen: settings.get().reloadNoticeSeen ?? 0,
       dataDir,
       autoReloadWatch: settings.get().autoReloadWatch === true,
       lastReload: globalThis[Symbol.for('our-free-model.last-reload')] ?? undefined,
@@ -1816,6 +1855,29 @@ function imageResolver(ctx, logger) {
 /** The fixed failure classes the pool proxy may surface to the client. */
 const POOL_REASONS = new Set(['no-lane', 'gateway-status', 'malformed', 'unreachable'])
 
+// ── per-model performance figures ─────────────────────────────────────────────
+// The roster asks for these on every mount, and they are hourly samples: a
+// minute of staleness costs nothing, while an outbound hop per page load is
+// pure load on the site. The in-flight promise is shared as well, so a burst of
+// mounts costs one request rather than one each.
+const PERF_FRESH_MS = 60_000
+let perfCache = { at: 0, data: null }
+let perfPending = null
+function perfSnapshot(root, fetchImpl) {
+  if (root === null || root === undefined) return Promise.resolve({ models: {} })
+  if (perfCache.data !== null && Date.now() - perfCache.at < PERF_FRESH_MS) return Promise.resolve(perfCache.data)
+  if (perfPending !== null) return perfPending
+  perfPending = readPerf({ root, fetch: fetchImpl })
+    .then(data => {
+      // Only a non-empty answer is worth keeping: caching "the site did not
+      // answer" would hide a recovery for a full minute.
+      if (Object.keys(data.models).length > 0) perfCache = { at: Date.now(), data }
+      return data
+    })
+    .finally(() => { perfPending = null })
+  return perfPending
+}
+
 export function createApiRoutes(deps) {
   return async function handler(req, res) {
     const url = new URL(req.url ?? '/', 'http://localhost')
@@ -1875,6 +1937,30 @@ export function createApiRoutes(deps) {
       }
       if (method === 'GET' && routePath === '/stats') {
         return send(200, buildStats(deps.stats.get(), deps.catalog()))
+      }
+      // Per-model performance figures for the roster's cards. The site's own
+      // metrics endpoint is public but sends no CORS headers, so the page
+      // cannot call it directly — this is the server-side hop. One request
+      // answers every model, and the map holds only models whose figure is
+      // trustworthy (see src/model-test.js); an absent model draws no strip.
+      //
+      // Cached for a minute and de-duplicated while in flight: the roster asks
+      // on every mount, and the figures are hourly samples — a fresh outbound
+      // request per page load buys nothing but load on the site.
+      if (method === 'GET' && routePath === '/perf') {
+        const credential = deps.sealedCredential?.() ?? null
+        const root = siteRootFor(credential?.base)
+        return send(200, await perfSnapshot(root, deps.perfFetch ?? directFetch))
+      }
+      // One model's hourly trend series, for the charts behind 详情. Separate
+      // from `/perf` because it is per model: the roster would otherwise pay
+      // twelve requests to draw twelve strips nobody has expanded yet.
+      if (method === 'GET' && routePath === '/perf/series') {
+        const modelId = url.searchParams.get('model') ?? ''
+        const credential = deps.sealedCredential?.() ?? null
+        const root = siteRootFor(credential?.base)
+        const series = await readSeries({ root, modelId, fetch: deps.perfFetch ?? directFetch })
+        return send(200, series === null ? { series: null } : series)
       }
       if (method === 'GET' && routePath === '/outlet') {
         return send(200, await deps.outletStatus())
@@ -1967,6 +2053,21 @@ export function createApiRoutes(deps) {
       if (method === 'GET' && routePath === '/meta') {
         return send(200, { ...deps.meta(), feed: { fetchedAt: deps.announcements.view().fetchedAt, source: deps.announcements.view().source, error: deps.announcements.view().error }, update: deps.update.status() })
       }
+      if (method === 'POST' && routePath === '/reload-notice/ack') {
+        const body = await readJson(req)
+        const at = body?.at
+        const current = Number(deps.settings.get().reloadedAt ?? 0)
+        // Only the timestamp this process announced may be acknowledged: an
+        // older page or a hand-written request must not pre-mark a future
+        // reload as seen.
+        if (typeof at !== 'number' || !Number.isSafeInteger(at) || at <= 0 || at !== current) {
+          return send(400, { error: 'at must match the current reloadedAt' })
+        }
+        deps.settings.update({ reloadNoticeSeen: at })
+        deps.settings.flush()
+        if (deps.settings.writeFailed === true) return send(500, { error: 'could not persist settings' })
+        return send(200, { ok: true, reloadNoticeSeen: at })
+      }
       if (method === 'POST' && routePath === '/eac/login/start') {
         const started = await deps.eacAuth.start()
         return send(started.error === undefined ? 200 : 404, started.error === undefined ? started : { error: started.error })
@@ -2028,6 +2129,41 @@ export function createApiRoutes(deps) {
       }
       if (method === 'GET' && routePath === '/picks') {
         return send(200, await deps.picks.view())
+      }
+      // ── 反馈与许愿 ──────────────────────────────────────────────────────────
+      // The page talks to these five routes and nothing else. Two properties are
+      // load-bearing and easy to lose in a refactor:
+      //
+      //  · the sign-in token never appears in any response — `status` answers
+      //    only `{signedIn, login}`, and the token itself stays in this process;
+      //  · a failed submission is never reported as success. The proxy already
+      //    refuses a missing receipt id, and a 401 from the collector is turned
+      //    into a 401 here so the page can drop to "signed out" and keep the
+      //    text the user typed.
+      if (routePath === '/feedback' || routePath.startsWith('/feedback/')) {
+        if (deps.feedback === undefined) return send(503, { error: '反馈服务不可用' })
+        const action = routePath.slice('/feedback'.length)
+        if (method === 'GET' && action === '') return send(200, deps.feedback.status())
+        if (method === 'POST' && action === '/start') return send(200, await deps.feedback.start())
+        if (method === 'POST' && action === '/poll') {
+          const body = await readJson(req)
+          return send(200, await deps.feedback.poll(body))
+        }
+        if (method === 'POST' && action === '/signout') return send(200, deps.feedback.signOut())
+        if (method === 'POST' && action === '/submit') {
+          const body = await readJson(req)
+          if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+            return send(400, { error: 'the request body must be a JSON object' })
+          }
+          // The version is stamped here rather than trusted from the page: a
+          // report is only actionable if it names the build that produced it.
+          return send(200, await deps.feedback.submit({
+            ...body,
+            version: deps.meta?.().version ?? '',
+            platform: typeof body.platform === 'string' ? body.platform : '',
+          }))
+        }
+        return send(404, { error: 'not found' })
       }
       if (method === 'POST' && routePath === '/announcements/ack') {
         const body = await readJson(req)

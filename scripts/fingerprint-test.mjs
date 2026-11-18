@@ -10,7 +10,7 @@
  * (v1.4.7 `BindOfficial`: a folded-name match rides the wire under the
  * official spelling with the caller's own definition) or is renamed to an
  * opaque `clint_<digest>`; the **full 13-tool official CLI set** is appended
- * from the captured `opencode_tools.json` minus whatever is already served;
+ * from the captured `ofm-tool-contracts.json` minus whatever is already served;
  * and **ghost call history is dropped** (calls naming tools this request no
  * longer serves, with their paired results). Each case below is one of the
  * behaviors the shaping must keep.
@@ -164,6 +164,79 @@ console.log('\n=== 6b. a bound tool keeps its history under the official name ==
   check('its result survives', body.messages.filter(message => message.role === 'tool').length, 1)
 }
 
+console.log('\n=== 6c. an emptied tool_calls field is removed, not forwarded (#787) ===')
+{
+  const body = {
+    tools: [chatTool('pwsh')],
+    messages: [
+      { role: 'user', content: 'go' },
+      { role: 'assistant', content: 'nothing to call', tool_calls: [] },
+    ],
+  }
+  applyFingerprint(body, false)
+  const assistant = body.messages.find(message => message.role === 'assistant')
+  check('a caller tool_calls: [] is removed', Object.hasOwn(assistant, 'tool_calls'), false)
+  check('the rest of the message survives', assistant.content, 'nothing to call')
+}
+{
+  const body = {
+    tools: [chatTool('pwsh')],
+    messages: [
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{ id: 'ghost-1', type: 'function', function: { name: 'vanished_tool', arguments: '{}' } }],
+      },
+      { role: 'tool', tool_call_id: 'ghost-1', content: 'orphan' },
+    ],
+  }
+  applyFingerprint(body, false)
+  check('a turn whose calls are all ghosts is dropped', body.messages.some(message => message.role === 'assistant'), false)
+  check('the orphan result goes with the call', body.messages.filter(message => message.role === 'tool').length, 0)
+}
+{
+  const body = {
+    tools: [chatTool('pwsh')],
+    messages: [
+      {
+        role: 'assistant',
+        content: 'still here',
+        tool_calls: [{ id: 'ghost-2', type: 'function', function: { name: 'vanished_tool', arguments: '{}' } }],
+      },
+    ],
+  }
+  applyFingerprint(body, false)
+  const assistant = body.messages.find(message => message.role === 'assistant')
+  check('a turn with text keeps its row after the field is removed', assistant.content, 'still here')
+  check('its emptied tool_calls field is gone', Object.hasOwn(assistant, 'tool_calls'), false)
+}
+{
+  const body = {
+    tools: [chatTool('pwsh')],
+    messages: [
+      { role: 'assistant', content: null, tool_calls: [{ id: 'keep-1', type: 'function', function: { name: 'pwsh', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'keep-1', content: 'ok' },
+    ],
+  }
+  applyFingerprint(body, false)
+  const assistant = body.messages.find(message => message.role === 'assistant')
+  check('a served call keeps its array', Array.isArray(assistant.tool_calls), true)
+  check('the kept call follows the wire name', assistant.tool_calls[0].function.name, wireNameOf('pwsh'))
+  check('the kept result stays paired', body.messages.filter(message => message.role === 'tool').length, 1)
+}
+{
+  const body = {
+    tools: [chatTool('pwsh')],
+    messages: [
+      { role: 'assistant', content: null, tool_calls: [], function_call: { name: 'Bash', arguments: '{}' } },
+    ],
+  }
+  applyFingerprint(body, false)
+  const assistant = body.messages.find(message => message.role === 'assistant')
+  check('the legacy function_call is retargeted', assistant.function_call?.name, 'shell')
+  check('the removed tool_calls array is not carried back', Object.hasOwn(assistant, 'tool_calls'), false)
+}
+
 console.log('\n=== 7. the Messages (Claude) shape carries input_schema, not parameters ===')
 {
   const body = {}
@@ -201,7 +274,7 @@ console.log('\n=== 9. the injected definitions are byte-for-byte the official on
   // even though the name is right. The definitions must equal the captured
   // asset (whose property order the reference also emits — Go serialises its
   // maps alphabetically).
-  const captured = JSON.parse(fs.readFileSync(new URL('../src/o2a/assets/opencode_tools.json', import.meta.url), 'utf8'))
+  const captured = JSON.parse(fs.readFileSync(new URL('../src/o2a/assets/ofm-tool-contracts.json', import.meta.url), 'utf8'))
   const body = {}
   applyFingerprint(body, false)
   const read = body.tools.find(tool => tool.function.name === 'read').function
@@ -257,11 +330,11 @@ console.log('\n=== 10b. title requests ship unshaped (v1.4.7) ===')
 
   const chat = { messages: [{ role: 'user', content: 'Generate a title for this conversation: hello' }], tools: [chatTool('read')] }
   applyFingerprint(chat, false)
-  check('a title-shaped body with tools is still shaped', /opencode, an interactive CLI tool|You are opencode/.test(noteOf(chat)), true)
+  check('a title-shaped body with tools is still shaped', noteOf(chat).includes("You are assisting with a user's software project through OFM."), true)
 
   const plain = { messages: [{ role: 'user', content: 'hello' }] }
   applyFingerprint(plain, false)
-  check('a plain toolless turn is still shaped', /You are opencode/.test(noteOf(plain)), true)
+  check('a plain toolless turn is still shaped', noteOf(plain).includes("You are assisting with a user's software project through OFM."), true)
 }
 
 console.log('\n=== 11. the port names the release it mirrors ===')
