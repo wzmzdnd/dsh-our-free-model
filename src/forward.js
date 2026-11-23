@@ -38,8 +38,7 @@ import { baseModelId, FINGERPRINT_TOOLS } from './upstream.js'
 import { flattenResponsesTools, restoreResponsesToolName } from './messages.js'
 import { anthropicFrames, anthropicMessage, countTokens, foldAnthropicOutcome, fromAnthropicRequest } from './anthropic.js'
 import { toMessagesResponse, tryOptimizations } from './local-optimize.js'
-import { carryFailure, forwardFailure } from './failure.js'
-import { deferStreamResponse } from './deferred-response.js'
+import { carryFailure, forwardFailure } from './http.js'
 import { geminiEndpoint, geminiError, geminiRoute } from './gemini.js'
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024
@@ -811,6 +810,39 @@ function createToolWire(body) {
       held.set(blockIndex, parked)
       return { kind: 'drop' }
     },
+    /**
+     * Route a completed tool block.
+     *
+     * Some adapters never emit `tool-call-delta`: they only close the block, so
+     * the whole call arrives here (issue #829, measured on the `minimax/*`
+     * channel — a stream that finished with `finish_reason: tool_calls` while
+     * carrying zero tool frames, so the client had nothing to run and the turn
+     * ended after a sentence of preamble). The non-streaming path already read
+     * these blocks through `foldForwardOutcome`; the streaming path only ever
+     * looked at deltas, and the two consumers then disagreed about the same
+     * turn.
+     *
+     * @returns {{kind:'drop'} | {kind:'forward', openAiIndex:number, first:boolean, id?:string, name:string, args:string}}
+     */
+    admitBlockEnd(block, blockIndex) {
+      if (classified.get(blockIndex) === false) return { kind: 'drop' }
+      const name = typeof block?.name === 'string' ? block.name : ''
+      if (name === '') return { kind: 'drop' }
+      if (!this.executable(name)) { classified.set(blockIndex, false); return { kind: 'drop' } }
+      classified.set(blockIndex, true)
+      const parked = held.get(blockIndex)
+      held.delete(blockIndex)
+      // Deltas already forwarded for this slot own its arguments; the block only
+      // fills in what they could not know (identity, and arguments when the
+      // adapter streamed none).
+      const streamed = parked !== undefined && parked.args.length > 0
+      const args = streamed ? parked.args.join('') : typeof block.arguments === 'string' ? block.arguments : ''
+      return {
+        kind: 'forward', openAiIndex: this.indexOf(blockIndex), first: !streamed,
+        id: typeof block.id === 'string' && block.id !== '' ? block.id : parked?.id,
+        name, args: streamed ? '' : args,
+      }
+    },
   }
 }
 
@@ -870,6 +902,53 @@ async function chatCompletions(req, res, complete, options = {}) {
 
   openStreamHeaders(res, options.heartbeatMs)
   sendSse(res, { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] })
+  // OpenAI's delta protocol puts `id` and `function.name` on the opening frame
+  // only, and every later frame is still a *function* delta. The shape this
+  // used to emit for a non-opening frame was a bare `{"index":N}` — no
+  // `function` at all — which a client that validates
+  // `delta.tool_calls[0].function` as an object rejects on the spot, and which
+  // carries nothing an accumulator could use anyway (#452). A frame with
+  // neither the opening fields nor argument bytes is not sent at all.
+  // `type: 'function'` goes on the opening frame because the non-streaming
+  // branch already spells it and the official chunk shape carries it.
+  const emitToolFrame = action => {
+    if (action.kind === 'drop') return
+    if (action.first) {
+      sendSse(res, {
+        id, object: 'chat.completion.chunk', created, model,
+        choices: [{
+          index: 0,
+          delta: {
+            tool_calls: [{
+              index: action.openAiIndex,
+              id: action.id,
+              type: 'function',
+              function: { name: action.name ?? '', arguments: '' },
+            }],
+          },
+          finish_reason: null,
+        }],
+      })
+    }
+    if (action.args) {
+      sendSse(res, { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { tool_calls: [{ index: action.openAiIndex, function: { arguments: action.args } }] }, finish_reason: null }] })
+    }
+  }
+  // Which slots have had an opening frame written. An adapter that only closes
+  // blocks still needs one synthesized frame per call, and a slot whose deltas
+  // were all dropped as decoys must not be re-opened by its block-end.
+  const opened = new Set()
+  const emitAction = action => {
+    if (action.kind === 'drop') return
+    const key = action.openAiIndex
+    if (opened.has(key)) {
+      // The identity frame is already on the wire; only arguments remain.
+      if (action.args) emitToolFrame({ ...action, first: false })
+      return
+    }
+    opened.add(key)
+    emitToolFrame(action)
+  }
   let outcome
   try {
     outcome = await complete({ model, openAi: body }, (chunk) => {
@@ -883,38 +962,21 @@ async function chatCompletions(req, res, complete, options = {}) {
         return
       }
       if (chunk.type === 'tool-call-delta') {
-        const action = tools.admit(chunk)
-        if (action.kind === 'drop') return
-        // OpenAI's delta protocol puts `id` and `function.name` on the opening
-        // frame only, and every later frame is still a *function* delta. The
-        // shape this branch used to emit for a non-opening frame was a bare
-        // `{"index":N}` — no `function` at all — which a client that validates
-        // `delta.tool_calls[0].function` as an object rejects on the spot, and
-        // which carries nothing an accumulator could use anyway (#452). A frame
-        // with neither the opening fields nor argument bytes is now simply not
-        // sent. `type: 'function'` goes on the opening frame because the
-        // non-streaming branch already spells it and the official chunk shape
-        // carries it.
-        if (action.first) {
-          sendSse(res, {
-            id, object: 'chat.completion.chunk', created, model,
-            choices: [{
-              index: 0,
-              delta: {
-                tool_calls: [{
-                  index: action.openAiIndex,
-                  id: action.id,
-                  type: 'function',
-                  function: { name: action.name ?? '', arguments: '' },
-                }],
-              },
-              finish_reason: null,
-            }],
-          })
-        }
-        if (action.args) {
-          sendSse(res, { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { tool_calls: [{ index: action.openAiIndex, function: { arguments: action.args } }] }, finish_reason: null }] })
-        }
+        emitAction(tools.admit(chunk))
+        return
+      }
+      // Some adapters close a tool block without ever streaming a delta for it
+      // (issue #829). `foldForwardOutcome` has always read these blocks, so the
+      // non-streaming path and `finish_reason` both knew about the call while
+      // the stream carried no frame for it — the client saw `tool_calls` with
+      // nothing to run. Emit the block through the same gate as a delta.
+      if (chunk.type === 'block-end' && chunk.block?.type === 'tool-call') {
+        const action = tools.admitBlockEnd(chunk.block, chunk.index)
+        // The slot's deltas already put its identity and arguments on the wire;
+        // the block-end only repeats them. Sending them again would double the
+        // arguments the client reassembles.
+        if (action.kind === 'forward' && opened.has(action.openAiIndex)) return
+        emitAction(action)
         return
       }
       if (chunk.type === 'usage') {
@@ -958,6 +1020,18 @@ async function chatCompletions(req, res, complete, options = {}) {
     res.write('data: [DONE]\n\n')
     res.end()
     return
+  }
+  // Last-resort consistency: `finish_reason` is derived from the outcome, so a
+  // turn that reports `tool_calls` must carry the frames for them. If every
+  // delta was dropped as a decoy but the outcome still holds runnable calls,
+  // synthesize one frame each rather than announcing a call the client cannot
+  // see. This is the guard #829 asked for; the block-end branch above is the
+  // normal path.
+  if (calls.length > 0 && opened.size === 0) {
+    for (const [i, call] of calls.entries()) {
+      opened.add(i)
+      emitToolFrame({ kind: 'forward', openAiIndex: i, first: true, id: call.id, name: call.name, args: call.arguments })
+    }
   }
   sendSse(res, {
     id, object: 'chat.completion.chunk', created, model,
@@ -1483,4 +1557,49 @@ export function toOpenAiUsage(usage) {
     prompt_tokens_details: { cached_tokens: usage.cacheReadTokens ?? 0 },
     completion_tokens_details: { reasoning_tokens: usage.reasoningTokens ?? 0 },
   }
+}
+
+/** Hold stream metadata until content arrives or the first heartbeat is due. */
+export function deferStreamResponse(res, heartbeatMs) {
+  let pending = true
+  let head
+  let writes = []
+  let bytes = 0
+  let timer
+  const clear = () => { clearTimeout(timer); timer = undefined }
+  const commit = () => {
+    if (!pending || res.destroyed) return
+    pending = false
+    clear()
+    if (head) res.writeHead(...head)
+    for (const row of writes) res.write(...row)
+    writes = []
+  }
+  const response = new Proxy(res, {
+    get(target, key) {
+      if (key === 'writeHead') return (...args) => {
+        if (!pending) return target.writeHead(...args)
+        head = args
+        if (args[0] >= 400) { writes = []; bytes = 0 }
+        if (!timer && heartbeatMs > 0) { timer = setTimeout(commit, heartbeatMs); timer.unref?.() }
+        return response
+      }
+      if (key === 'flushHeaders') return () => { if (!pending) target.flushHeaders() }
+      if (key === 'write') return (...args) => {
+        if (!pending) return target.write(...args)
+        const callback = typeof args.at(-1) === 'function' ? args.pop() : undefined
+        writes.push(args)
+        bytes += Buffer.byteLength(args[0])
+        if (callback) queueMicrotask(callback)
+        if (bytes >= 64 * 1024) commit()
+        return true
+      }
+      if (key === 'end') return (...args) => { commit(); return target.end(...args) }
+      const value = Reflect.get(target, key, target)
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+  })
+  res.once('finish', clear)
+  res.once('close', clear)
+  return { response, commit, dispose: clear }
 }

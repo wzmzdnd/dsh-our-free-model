@@ -40,9 +40,9 @@
 ## Community
 
 <div align="center">
-  <img src="docs/images/qq-group-891170115.png" alt="QR code for OFM技术交流[17群] (QQ group: 891170115)" width="300">
+  <img src="docs/images/qq-group-386179533.png" alt="QR code for OFM技术交流群[1群] (QQ group: 386179533)" width="300">
   <br>
-  <b>QQ group: 891170115 (OFM技术交流[17群])</b>
+  <b>QQ group: 386179533 (OFM技术交流群[1群])</b>
   <br>
   Scan the QR code to join, discuss the plugin, report issues and share tips.
 </div>
@@ -117,7 +117,7 @@ the picker by itself as soon as a probe gets through.
 > If you prefer npm:
 >
 > ```
-> dsh plugin --profile web add @ebony-vinyl/dsh-our-free-model@2.8.6
+> dsh plugin --profile web add @ebony-vinyl/dsh-our-free-model@2.9.0
 > ```
 >
 > Its bundle id carries the scope (`@ebony-vinyl/dsh-our-free-model`), so it cannot
@@ -150,7 +150,7 @@ and installation contract rather than assuming every desktop shell shares this g
 To install manually as a real directory, use a trusted local tarball:
 
 1. Create `<DSH_HOME>/profiles/<profile>/vendor/`. From the reviewed repository, run `npm pack --ignore-scripts --pack-destination "<DSH_HOME>/profiles/<profile>/vendor"`, or place an official same-version release tarball from this repository there. Local packing does not publish to npm.
-2. Add `"dsh-our-free-model": "file:./vendor/dsh-our-free-model-2.8.6.tgz"` to the profile's `package.json` dependencies, then use the host's installation flow to resolve it. Keep the filename version aligned with this repository's `package.json`; do not substitute a same-named npm registry version.
+2. Add `"dsh-our-free-model": "file:./vendor/dsh-our-free-model-2.9.0.tgz"` to the profile's `package.json` dependencies, then use the host's installation flow to resolve it. Keep the filename version aligned with this repository's `package.json`; do not substitute a same-named npm registry version.
 3. Append `"dsh-our-free-model"` to `dsh.profile.bundles`.
 
 When the package manager owns the installed bytes, set `distribution: 'managed'` in the bundle config or plugin `settings.json`. The package manager then handles updates; in-app upgrades, announcement polling and hot reload stand down while model access remains available. For later updates, replace the trusted tarball and update its dependency path so the old lockfile cannot restore an older copy.
@@ -424,14 +424,15 @@ src/token-saver/index.js compaction pipeline: prompt injection -> tool-output co
 src/token-saver/inject.js idempotent injection and stripping on the chat / messages /
                 responses wires
 src/token-saver/prompts.js the caveman and ponytail prompt families and their levels
-src/token-saver/rtk/ tool-output filters: git diff/status/log, grep, find, ls, tree,
+src/token-saver/compact/ tool-output filters: git diff/status/log, grep, find, ls, tree,
                 build logs, numbered dumps, search listings, duplicate log lines
 src/local-optimize.js the five local answers: quota, prefix, title, suggestion, filepath
 src/combos.js fallback chains: virtual catalog rows, two strategies, intersected capacities
 src/route/classify.js one failure vocabulary and cooldown policy for every lane
 src/trust.js    request trust fence for the plugin's routes (connection bridge
                 + structural fallback)
-src/push.js     SSE push hub: arrivals, update availability, upgrade done
+index.js        SSE push hub (createPushHub; src/push.js was folded in): arrivals,
+                update availability, upgrade done
 src/feed.js     remote announcement feed: multi-source fetch, validation, cache,
                 arrival detection
 src/updater.js  in-app upgrade: manifest validation, SHA-256 checks, backup,
@@ -877,4 +878,18 @@ Thanks to [Jet (iJetLi)](https://gitee.com/iJetLi) for the channel pack
 for all ten built-in account channels come from it; its LICENSE and NOTICE.md
 sit in that directory.
 
-Historical sources include [opencode2api](https://github.com/jasonxu114514/opencode2api) (GPL-3.0) for free-lane request shaping, [free-claude-code](https://github.com/Alishahryar1/free-claude-code) (AGPL-3.0-only) for the provider directory and local answers, and [RTK](https://github.com/rtk-ai/rtk) for output compression. See the [2.8.6 verification notes](docs/verification/2026-11-18-independent-core.md) for the replacement scope and [the Chinese acknowledgements](README.md#致谢) for the complete source list.
+Thanks also to:
+
+- [models.dev](https://github.com/anomalyco/models.dev) (MIT) — model windows, output ceilings and thinking tiers. The catalogue data is used under MIT; the full text is in [LICENSE](LICENSE).
+- [9router](https://github.com/decolua/9router) (MIT) — origin of the eight evidence scripts under `scripts/probes/`. Those eight files are byte-for-byte copies with only the probe base URL changed; each carries its MIT attribution in the file header and the full licence is in [LICENSE](LICENSE#9router--mit). They import 9router's own modules, so they run only inside that project's checkout, and they are not part of the release set.
+- [magpie-muse-web](https://github.com/JohnWangggg/magpie-muse-web) (no SPDX licence declared upstream) — upstream of the `muse-web` bridge extension.
+
+**The following projects have no code or data left in this repository.** They are kept as a historical record only:
+
+- [opencode2api](https://github.com/jasonxu114514/opencode2api) (GPL-3.0) — the earliest reference for free-lane request shaping. 2.8.6 rewrote the implementation and deleted its assets; the current code shares no text, function name or constant table with that project, and works only from official assets generated from [sst/opencode](https://github.com/sst/opencode) v2.2.3 (MIT). See the [maintenance notes](src/o2a/SYNC.md).
+- [free-claude-code](https://github.com/Alishahryar1/free-claude-code) (AGPL-3.0-only) — the earliest reference for the provider directory and the five local answers. 2.8.6 rewrote the local answers and rebuilt the directory from models.dev; what survives is five optimization ids and some provider ids as **persisted configuration keys** (renaming one would silently re-enable an optimization a user had switched off). See [provider compatibility](docs/provider-compatibility.md).
+- [trae-mate](https://github.com/luckymiaow/trae-mate) (MIT) — an early reference for the TRAE check-in flow, since rewritten.
+- [dsh-cline-pass](https://github.com/codeOct/dsh-cline-pass) (MIT) — an early reference for Cline quota and request logging, since rewritten.
+- [rtk](https://github.com/rtk-ai/rtk) (CLI Apache-2.0, engine BUSL-1.1) — the earliest reference for the tool-output filters. `src/token-saver/compact/` has been rewritten in full; only RTK's output markers and thresholds remain, because those markers are a wire format a model has been trained to read — changing them would change model behaviour rather than make the code more original. The replacement scope is in the [2.8.6 verification notes](docs/verification/2026-11-18-independent-core.md).
+
+The root MIT licence covers only the code OFM wrote. The components and data still in use are provided under their own licences, whose full terms govern. This list is a provenance record and does not change any component's licence.

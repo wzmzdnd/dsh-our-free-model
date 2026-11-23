@@ -262,6 +262,60 @@ await checkAsync('every streamed tool-call frame carries a function delta (#452)
   assert.equal(frames.map(frame => frame.function.arguments).join(''), '{"x":1}')
 })
 
+await checkAsync('a channel that only closes a tool block still emits its call (#829)', async () => {
+  const lane = makeLane()
+  const base = await serve(lane)
+  // The `minimax/*` shape measured in #829: text, then a block-end carrying the
+  // whole call, and not a single `tool-call-delta` in between. The stream used
+  // to announce `finish_reason: tool_calls` with zero tool frames, so the client
+  // had nothing to run and the turn ended after the preamble.
+  lane.script = () => ({
+    chunks: [
+      { type: 'text-delta', index: 0, text: 'I will list the files.' },
+      { type: 'block-end', index: 1, block: { type: 'tool-call', id: 'call_be', name: 'list_files', arguments: '{"path":"."}' } },
+      { type: 'usage', usage: { inputTokens: 5, outputTokens: 6, totalTokens: 11 } },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ],
+    outcome: { text: 'I will list the files.', toolCalls: [{ slot: 1, id: 'call_be', name: 'list_files', arguments: '{"path":"."}' }] },
+  })
+  const response = await authFetch(base, '/v1/chat/completions', {
+    model: 'mimo-v2.6-flash-free', stream: true,
+    tools: [{ type: 'function', function: { name: 'list_files', parameters: { type: 'object', properties: {} } } }],
+  })
+  assert.equal(response.status, 200)
+  const body = await response.text()
+  const frames = toolCallDeltas(body)
+  assert.ok(frames.length > 0, `a closed tool block must produce frames, got ${JSON.stringify(body)}`)
+  const opening = frames.find(frame => frame.function?.name !== undefined)
+  assert.equal(opening?.function?.name, 'list_files')
+  assert.equal(opening?.id, 'call_be')
+  const args = frames.filter(frame => frame.function?.arguments !== undefined).map(frame => frame.function.arguments).join('')
+  assert.equal(args, '{"path":"."}')
+  assert.ok(body.includes('"finish_reason":"tool_calls"'), 'the finish reason still reports the call')
+})
+
+await checkAsync('a block-end after its own deltas never doubles the arguments (#829)', async () => {
+  const lane = makeLane()
+  const base = await serve(lane)
+  lane.script = () => ({
+    chunks: [
+      { type: 'tool-call-delta', index: 0, id: 'call_a', name: 'read', argumentsDelta: '{"file"' },
+      { type: 'tool-call-delta', index: 0, argumentsDelta: ':"x"}' },
+      { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call_a', name: 'read', arguments: '{"file":"x"}' } },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ],
+    outcome: { text: '', toolCalls: [{ slot: 0, id: 'call_a', name: 'read', arguments: '{"file":"x"}' }] },
+  })
+  const response = await authFetch(base, '/v1/chat/completions', {
+    model: 'mimo-v2.6-flash-free', stream: true,
+    tools: [{ type: 'function', function: { name: 'read', parameters: { type: 'object', properties: {} } } }],
+  })
+  const frames = toolCallDeltas(await response.text())
+  assert.equal(frames.map(frame => frame.function?.arguments ?? '').join(''), '{"file":"x"}',
+    'the block-end must not append the arguments its deltas already sent')
+  assert.equal(frames.filter(frame => frame.id !== undefined).length, 1, 'identity rides one frame only')
+})
+
 await checkAsync('a decoy tool call never reaches the streaming client', async () => {
   const lane = makeLane()
   const base = await serve(lane)
@@ -761,19 +815,24 @@ check('the adapter conversion keeps every caller tool', () => {
   assert.equal(declared.length, callerTools.length)
 })
 
-check('a caller list binds what it can and renames the rest; the official set completes', () => {
+check('a caller list renames every foreign tool; the official set completes', () => {
   const body = { tools: toToolDefs([normalizeTool(openAiTool('pwsh')), normalizeTool(openAiTool('glob'))], 'chat') }
   applyFingerprint(body, false)
-  // v1.4.7 BindOfficial: `glob` folds onto the official spelling with the
-  // caller's own definition; `pwsh` has no official and takes the opaque
-  // rename; the remaining officials are appended exactly once.
+  // An official name is reserved for the official definition. `glob` folds onto
+  // the official spelling but carries the caller's own prose, so it takes an
+  // opaque handle like `pwsh` — a caller schema at an official name is answered
+  // 429 (measured 2026-11-22); the official set, `glob` included, is appended
+  // afterwards and declared exactly once.
   const names = body.tools.map(tool => tool.function.name)
   const clientWires = names.filter(name => name.startsWith(CLIENT_TOOL_PREFIX))
-  assert.deepEqual(clientWires, [clientToolWireName('pwsh')])
-  const bound = body.tools.find(tool => tool.function.name === 'glob')
-  assert.equal(bound.function.description, 'glob tool')
+  assert.deepEqual(clientWires, [clientToolWireName('pwsh'), clientToolWireName('glob')])
+  const renamedGlob = body.tools.find(tool => tool.function.name === clientToolWireName('glob'))
+  assert.ok(renamedGlob, 'the caller glob rides an opaque handle')
+  // The caller's words survive under the handle; only ASCII spaces become NBSP,
+  // which stops a literal phrase in a caller description matching an upstream rule.
+  assert.equal(renamedGlob.function.description, 'glob\u00a0tool')
   const officials = names.filter(name => !name.startsWith(CLIENT_TOOL_PREFIX))
-  assert.deepEqual(officials.filter(name => name !== 'glob'), V2_OFFICIAL_TOOL_ORDER.filter(name => name !== 'glob'))
+  assert.deepEqual(officials, [...V2_OFFICIAL_TOOL_ORDER])
   assert.equal(officials.filter(name => name === 'glob').length, 1)
   assert.equal(String(body.tools[0].function.description).includes('unavailable'), false)
   assert.equal(body.tool_choice, undefined)
@@ -787,11 +846,19 @@ check('an empty caller list still gets the official set, and no tool_choice', ()
   assert.equal(body.tool_choice, undefined)
 })
 
-await checkAsync('a caller tool reusing a gate name binds and maps back', async () => {
+await checkAsync('a caller spelling of a gate name takes a handle and maps back', async () => {
   const body = { tools: toToolDefs([normalizeTool(openAiTool('read'))], 'chat') }
   const map = applyFingerprint(body, false)
+  const wire = clientToolWireName('read')
+  // The official name carries the official schema; the caller's own bytes live
+  // on the handle. Mapping "read" itself would be wrong — that name no longer
+  // refers to the caller's tool on the wire.
   assert.equal(body.tools.filter(tool => tool.function.name === 'read').length, 1)
-  assert.equal(body.tools.find(tool => tool.function.name === 'read').function.description, 'read tool')
+  assert.deepEqual(body.tools.find(tool => tool.function.name === 'read').function.parameters.required, ['path'])
+  const handle = body.tools.find(tool => tool.function.name === wire)
+  assert.ok(handle, 'the caller read rides an opaque handle')
+  assert.equal(handle.function.description, 'read\u00a0tool')
+  assert.equal(map.get(wire), 'read')
   assert.equal(map.get('read'), undefined)
 })
 

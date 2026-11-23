@@ -43,6 +43,9 @@ const suites = [
   ['legacy-upgrade', 'legacy-upgrade-test.mjs', mode === 'contributor' ? [] : ['--production']],
   ['engine-payload', 'engine-payload-test.mjs', []],
   ['release-preparation', 'release-preparation-test.mjs', []],
+  // The npm channel is a rename of this tree; a missed registration literal
+  // ships a package whose two halves mount under different names (#725/#835).
+  ['scoped-publish', 'scoped-publish-test.mjs', []],
   ['client-lint', 'client-lint.mjs', []],
   ['sponsor', 'sponsor-test.mjs', []],
   ['heatmap', 'heatmap-test.mjs', []],
@@ -118,6 +121,8 @@ const suites = [
   ['wire-tool-alias', 'wire-tool-alias-test.mjs', []],
   ['opencode-parity', 'opencode-parity-test.mjs', []],
   ['free-lane-wire', 'free-lane-wire-test.mjs', []],
+  ['lane-exit', 'lane-exit-test.mjs', []],
+  ['o2a-assets', 'o2a-assets-test.mjs', []],
   ['freetier-gate', 'freetier-gate-test.mjs', []],
   ['free-lane-quota', 'free-lane-quota-test.mjs', []],
   ['extensions', 'extensions-test.mjs', []],
